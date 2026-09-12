@@ -566,7 +566,22 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 							ctx.Warnf("Cannot flush response header from mitm'd client: %v", err)
 							return false
 						}
-						proxy.proxyWebsocket(ctx, wsConn, client)
+						// The client can send its first frame in the same
+						// write as the upgrade request, so those bytes are
+						// already in the request parser's buffer. Relay them
+						// before the raw connection, or they never reach the
+						// origin and both ends wait. Writes still go straight
+						// to the connection.
+						var clientSide io.ReadWriter = client
+						if br := clientReader.Reader(); br.Buffered() > 0 {
+							if pending, peekErr := br.Peek(br.Buffered()); peekErr == nil {
+								clientSide = struct {
+									io.Reader
+									io.Writer
+								}{io.MultiReader(bytes.NewReader(bytes.Clone(pending)), client), client}
+							}
+						}
+						proxy.proxyWebsocket(ctx, wsConn, clientSide)
 						return false
 					}
 
