@@ -201,35 +201,27 @@ func (proxy *ProxyHttpServer) handleH2MitmStream(
 	w.WriteHeader(resp.StatusCode)
 
 	if resp.Body != nil {
+		// Streaming (gRPC/Connect/SSE/chunked): flush each chunk so it reaches the
+		// client as it arrives. Mirrors net/http/httputil.ReverseProxy.flushInterval.
+		// A fixed-length response lets the h2 server batch writes for throughput.
+		var dst io.Writer = w
 		if shouldFlushStreaming(resp) {
-			// Streaming (gRPC/Connect/SSE/chunked): flush each chunk so it reaches the
-			// client as it arrives. Mirrors net/http/httputil.ReverseProxy.flushInterval.
-			rc := http.NewResponseController(w)
-			buf := make([]byte, 32*1024)
-			for {
-				nr, er := resp.Body.Read(buf)
-				if nr > 0 {
-					if _, ew := w.Write(buf[:nr]); ew != nil {
-						ctx.Warnf("HTTP/2 MITM: error writing response body: %v", ew)
-						break
-					}
-					_ = rc.Flush()
-				}
-				if er != nil {
-					// Mirror net/http/httputil.ReverseProxy.copyBuffer: io.EOF is the
-					// normal end of stream and context.Canceled means the client went
-					// away or cancelled the request, so neither is worth logging.
-					if er != io.EOF && !errors.Is(er, context.Canceled) {
-						ctx.Warnf("HTTP/2 MITM: error reading response body: %v", er)
-					}
-					break
-				}
+			dst = flushWriter{w: w}
+		}
+		_, readErr, writeErr := copyResponseBody(dst, resp.Body)
+		if writeErr != nil {
+			ctx.Warnf("HTTP/2 MITM: error writing response body: %v", writeErr)
+		}
+		if readErr != nil {
+			// The upstream body ended early: reset the stream rather than end
+			// it, so the client does not take a prefix for the whole body.
+			// context.Canceled means the client went away or cancelled the
+			// request, which is not worth logging (as in ReverseProxy).
+			if !errors.Is(readErr, context.Canceled) {
+				ctx.Warnf("HTTP/2 MITM: error reading response body: %v", readErr)
 			}
-		} else {
-			// Fixed-length response: let the h2 server batch writes for throughput.
-			if _, err := io.Copy(w, resp.Body); err != nil {
-				ctx.Warnf("HTTP/2 MITM: error writing response body: %v", err)
-			}
+			abortIncompleteResponse(w, r)
+			return
 		}
 	}
 

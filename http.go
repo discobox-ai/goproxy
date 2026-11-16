@@ -15,6 +15,10 @@ func (proxy *ProxyHttpServer) handleHttp(w http.ResponseWriter, r *http.Request)
 		proxy.NonproxyHandler.ServeHTTP(w, r)
 		return
 	}
+	// served is the request the server handed in: a request filter may return
+	// one on another context, and only served says whether an http.Server is
+	// serving this response (see abortIncompleteResponse).
+	served := r
 	r, resp := proxy.filterRequest(r, ctx)
 
 	if resp == nil {
@@ -103,9 +107,14 @@ func (proxy *ProxyHttpServer) handleHttp(w http.ResponseWriter, r *http.Request)
 		copyWriter = &flushWriter{w: w}
 	}
 
-	nr, err := io.Copy(copyWriter, resp.Body)
+	nr, readErr, writeErr := copyResponseBody(copyWriter, resp.Body)
 	if err := resp.Body.Close(); err != nil {
 		ctx.Warnf("Can't close response body %v", err)
+	}
+	if readErr != nil {
+		ctx.Warnf("Error reading response body after %v bytes: %v", nr, readErr)
+		abortIncompleteResponse(w, served)
+		return
 	}
 
 	// Forward upstream response trailers. Two cases:
@@ -134,5 +143,5 @@ func (proxy *ProxyHttpServer) handleHttp(w http.ResponseWriter, r *http.Request)
 			}
 		}
 	}
-	ctx.Logf("Copied %v bytes to client error=%v", nr, err)
+	ctx.Logf("Copied %v bytes to client error=%v", nr, writeErr)
 }
